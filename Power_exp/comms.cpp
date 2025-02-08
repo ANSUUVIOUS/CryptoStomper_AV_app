@@ -86,7 +86,7 @@ BOOL CCommunication::GetProcesses(VOID){
 
 	BOOL bSuccess = DeviceIoControl(GetProcessesDriver, IOCTL_GET_PROCESSES, NULL, 0, NULL, 0, &dwRetBytes, NULL);
 	if (!bSuccess){
-		printf("Could not retrieve the process list size from the system. Please investigate the driver.");
+		printf("Could not retrieve the process list size from the system. Please investigate the driver.\n");
 		RtlSecureZeroMemory(ProcessList, sizeof(IPLIST));
 		free(ProcessList);
 		ProcessList = NULL;
@@ -99,7 +99,7 @@ BOOL CCommunication::GetProcesses(VOID){
 
 	bSuccess = DeviceIoControl(GetProcessesDriver, IOCTL_GET_PROCESSES, NULL, 0, entries, sizeof(PLIST) * size, &dwRetBytes, NULL);
 	if (!bSuccess){
-		printf("Could not retrieve the process list from the system. Please investigate the driver.");
+		printf("Could not retrieve the process list from the system. Please investigate the driver.\n");
 		RtlSecureZeroMemory(ProcessList, sizeof(IPLIST));
 		free(ProcessList);
 		ProcessList = NULL;

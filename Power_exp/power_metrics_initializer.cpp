@@ -776,6 +776,11 @@ INT main(INT argc, LPSTR * argv) {
     CCommunication comms;
     PerformanceMonitor monitor;
 
+    if (argc < 2) {
+        printf("Too little arguments - therefore exiting.\n");
+        return -1;
+    }
+
     BOOL results = comms.Initialize();
     if (!results) {
         return -1;
@@ -784,18 +789,15 @@ INT main(INT argc, LPSTR * argv) {
     SIZE_T edge_text_size = 0;
     PVOID edge_text_address = NULL;
 
-    PVOID edge_address = comms.GetImageBase(4900)->ImageBase;
+    PVOID edge_address = comms.GetImageBase(std::stoi(argv[1]))->ImageBase;
     PBYTE edge_text_memory = NULL;
-    //PVOID edge_address_userland = GetProcessImageBaseAddress(4900);
-    //monitor.GetTextSectionInfo(edge_address_userland, &edge_text_address, &edge_text_size);
-    GetProcessTextSectionInfo(4900, edge_address, &edge_text_address, &edge_text_size, &edge_text_memory);
 
-
+    GetProcessTextSectionInfo(std::stoi(argv[1]), edge_address, &edge_text_address, &edge_text_size, &edge_text_memory);
     free(edge_text_memory);
 
-    comms.KillProcess(4900);
+    comms.KillProcess(std::stoi(argv[1]));
 
-    printf("%d is the text size.", edge_text_size);
+    printf("%d is the text size\n", edge_text_size);
 
 
    //return systemtest();
