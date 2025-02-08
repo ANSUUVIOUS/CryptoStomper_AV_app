@@ -800,6 +800,7 @@ INT main(INT argc, LPSTR * argv) {
     printf("%d is the text size\n", edge_text_size);
 
 
+
    //return systemtest();
 }
 
