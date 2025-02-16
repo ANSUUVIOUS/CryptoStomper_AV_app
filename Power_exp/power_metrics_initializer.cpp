@@ -9,13 +9,20 @@
 #include <strsafe.h>
 #include <tchar.h>
 #include <stdio.h>
-
+#include <comdef.h>
+#include <Wbemidl.h>
 #include <psapi.h>
+
 #include <iostream>
 #include <string>
+#include <chrono>
+#include <thread>
+
 
 #include "comms.hpp"
 
+
+#pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "Pdh.lib")
 #pragma comment(lib, "psapi.lib")
 
@@ -26,76 +33,16 @@
 #define HIGH_BATTERY_DRAIN -10  // Negative value indicates battery drain
 #define CONSISTENT_HIGH_USAGE_DURATION 3  // Number of consecutive readings
 
+
+#define HIGH_CPU_PID_THRESOLD 30
+#define HIGH_GPU_PID_THRESHOLD 30
+
 #define DEBUG 0
+#define NULL nullptr
 
 
-class PerformanceMonitor {
-private:
-    PDH_HQUERY hQuery;
-    PDH_HCOUNTER hCounterCPU, hCounterGPU, hCounterPower, hCounterBattery;
-    BOOL hasPowerCounter = TRUE, hasGPUCounter = TRUE, hasBatteryCounter = TRUE;
-    typedef struct _SystemMetrics {
-        DOUBLE cpuUsage;
-        DOUBLE gpuUsage;
-        DOUBLE powerUsage;
-        DOUBLE batteryDischargeRate;
-    } SystemMetrics;
-
+class Utils {
 public:
-    PerformanceMonitor(VOID) {
-        // Initialize PDH Query
-        if (PdhOpenQuery(NULL, 0, &hQuery) != ERROR_SUCCESS) {
-            std::cerr << "Failed to open PDH Query" << std::endl;
-            return;
-        }
-
-        // Add CPU counter
-        if (PdhAddCounter(hQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &hCounterCPU) != ERROR_SUCCESS) {
-            std::cerr << "Failed to add CPU counter" << std::endl;
-        }
-        else {
-            std::cout << "Successfully got the CPU Counter" << std::endl;
-        }
-
-        //// Add GPU counter (if available)
-        ////if (PdhAddCounter(hQuery, L"\\GPU Engine(*)\\Utilization Percentage", 0, &hCounterGPU) != ERROR_SUCCESS) {
-        //if (PdhAddCounter(hQuery, L"\\GPU Engine(*engtype_3D)\\Utilization Percentage", 0, &hCounterGPU) != ERROR_SUCCESS) {
-        //    std::cerr << "GPU monitoring not available." << std::endl;
-        //    hasGPUCounter = false;
-        //}
-        //else {
-        //    std::cout << "Successfully got the GPU Counter" << std::endl;
-        //}
-
-
-        // Add Power Meter counter (if available)
-        if (PdhAddCounter(hQuery, L"\\Power Meter(*)\\Power", 0, &hCounterPower) != ERROR_SUCCESS) {
-            std::cerr << "Power meter monitoring not available." << std::endl;
-            hasPowerCounter = false;
-        }
-        else {
-            std::cout << "Successfully got the Power Meter" << std::endl;
-        }
-
-
-        // Add Battery Discharge Rate counter (if available)
-        if (PdhAddCounter(hQuery, L"\\Battery Status(*)\\Discharge Rate", 0, &hCounterBattery) != ERROR_SUCCESS) {
-            std::cerr << "Battery discharge monitoring not available." << std::endl;
-            hasBatteryCounter = false;
-        }
-        else {
-            std::cout << "Successfully got the Battery Discharge rate" << std::endl;
-        }
-
-
-        // Initial data collection
-        PdhCollectQueryData(hQuery);
-    }
-
-    ~PerformanceMonitor(VOID) {
-        PdhCloseQuery(hQuery);
-    }
-
     std::string RunPowerShellCommand(const std::wstring& command) {
         HANDLE hReadPipe, hWritePipe;
         SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
@@ -122,7 +69,7 @@ public:
 
         // Start PowerShell process
         if (!CreateProcessW(NULL, &psCommand[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-            std::cerr << "❌ Failed to start PowerShell.\n";
+            std::wcerr << L"❌ Failed to start PowerShell.\n";
             CloseHandle(hReadPipe);
             CloseHandle(hWritePipe);
             return "";
@@ -149,24 +96,78 @@ public:
         return output;
     }
 
+    std::wstring GetProcessName(DWORD pid) {
+        // Open the process with required access rights
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!hProcess) {
+            wprintf(L"Unable to open process %d to query its process name.\n", pid);
+            return L"<Unknown>";
+        }
+
+        WCHAR processName[MAX_PATH] = L"<Unknown>";
+
+        // Try to get the base name of the main module
+        if (GetModuleBaseNameW(hProcess, NULL, processName, sizeof(processName) / sizeof(WCHAR)) == 0) {
+            wprintf(L"GetModuleBaseNameW failed for process %d, trying QueryFullProcessImageNameW...\n", pid);
+
+            // Fallback: Use QueryFullProcessImageNameW if GetModuleBaseNameW fails
+            DWORD size = MAX_PATH;
+            if (!QueryFullProcessImageNameW(hProcess, 0, processName, &size)) {
+                wprintf(L"QueryFullProcessImageNameW also failed for process %d.\n", pid);
+                CloseHandle(hProcess);
+                return L"<Unknown>";
+            }
+        }
+
+        CloseHandle(hProcess);  // Close the handle to the process
+        return std::wstring(processName);  // Return the process name as a wstring
+    }
+
+    BOOL TerminateProcessByPID(DWORD pid) {
+        // Open the process with terminate rights
+        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if (hProcess == NULL) {
+            if (DEBUG) {
+                wprintf(L"Failed to open process with PID %lu. Error code: %lu\n", pid, GetLastError());
+            }
+            return FALSE;
+        }
+
+        // Attempt to terminate the process
+        if (!TerminateProcess(hProcess, 0)) {
+            if (DEBUG) {
+                wprintf(L"Failed to terminate process with PID %lu. Error code: %lu\n", pid, GetLastError());
+            }
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+
+        if (DEBUG) {
+            wprintf(L"Successfully terminated process with PID %lu.\n", pid);
+        }
+
+        CloseHandle(hProcess);
+        return TRUE;
+    }
+
     BOOL GetTextSectionInfo(PVOID pBaseAddress, PVOID* pTextSectionAddress, SIZE_T* pTextSectionSize) {
         // Check if the base address is valid
         if (!pBaseAddress) {
-            printf("Invalid base address\n");
+            wprintf(L"Invalid base address\n");
             return FALSE;
         }
 
         // Get the DOS header
         PIMAGE_DOS_HEADER pDosHeader = (PIMAGE_DOS_HEADER)pBaseAddress;
         if (pDosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
-            printf("Invalid DOS header\n");
+            wprintf(L"Invalid DOS header\n");
             return FALSE;
         }
 
         // Get the NT headers
         PIMAGE_NT_HEADERS pNtHeaders = (PIMAGE_NT_HEADERS)((PBYTE)pBaseAddress + pDosHeader->e_lfanew);
         if (pNtHeaders->Signature != IMAGE_NT_SIGNATURE) {
-            printf("Invalid PE header\n");
+            wprintf(L"Invalid PE header\n");
             return FALSE;
         }
 
@@ -184,206 +185,655 @@ public:
         }
 
         // .text section not found
-        printf(".text section not found\n");
+        wprintf(L".text section not found\n");
+        return FALSE;
+    }
+
+    // Function to read memory from another process
+    BOOL ReadProcessMemorySafe(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize) {
+        SIZE_T bytesRead;
+        if (!ReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, &bytesRead) || bytesRead != nSize) {
+            wprintf(L"Failed to read memory at address 0x%p. Error: %d\n", lpBaseAddress, GetLastError());
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    // Function to get the .text section address and size of another process
+    BOOL GetProcessTextSectionInfo(DWORD pid, PVOID pBaseAddress, PVOID* pTextSectionAddress, SIZE_T* pTextSectionSize, PBYTE* pTextMem) {
+        // Open the target process
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (!hProcess) {
+            wprintf(L"Failed to open process (PID: %d). Error: %d\n", pid, GetLastError());
+            return FALSE;
+        }
+
+        // Read the DOS header
+        IMAGE_DOS_HEADER dosHeader;
+        if (!ReadProcessMemorySafe(hProcess, pBaseAddress, &dosHeader, sizeof(dosHeader))) {
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+
+        // Validate the DOS header
+        if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
+            wprintf(L"Invalid DOS header\n");
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+
+        // Read the NT headers
+        IMAGE_NT_HEADERS ntHeaders;
+        if (!ReadProcessMemorySafe(hProcess, (PBYTE)pBaseAddress + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders))) {
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+
+        // Validate the NT headers
+        if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
+            wprintf(L"Invalid NT headers\n");
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+
+        // Read the section headers
+        IMAGE_SECTION_HEADER sectionHeader;
+        DWORD sectionOffset = dosHeader.e_lfanew + sizeof(ntHeaders.Signature) + sizeof(ntHeaders.FileHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
+
+        // Iterate through the section table to find the .text section
+        for (DWORD i = 0; i < ntHeaders.FileHeader.NumberOfSections; i++) {
+            if (!ReadProcessMemorySafe(hProcess, (PBYTE)pBaseAddress + sectionOffset + (i * sizeof(sectionHeader)), &sectionHeader, sizeof(sectionHeader))) {
+                CloseHandle(hProcess);
+                return FALSE;
+            }
+
+            // Check if this is the .text section
+            if (strcmp((PCHAR)sectionHeader.Name, ".text") == 0) {
+                // Calculate the .text section address and size
+                *pTextSectionAddress = (PBYTE)pBaseAddress + sectionHeader.VirtualAddress;
+                *pTextSectionSize = sectionHeader.Misc.VirtualSize;
+                *pTextMem = ReadTextSectionBytes(hProcess, *pTextSectionAddress, *pTextSectionSize);
+                CloseHandle(hProcess);
+                return TRUE;
+            }
+        }
+
+        // .text section not found
+        wprintf(L".text section not found for process %d\n", pid);
+        CloseHandle(hProcess);
         return FALSE;
     }
 
 
+    // Function to read bytes from the .text section of another process
+    BYTE* ReadTextSectionBytes(HANDLE hProcess, PVOID pTextSectionAddress, SIZE_T textSectionSize) {
+        // Allocate a buffer to hold the .text section bytes
+        PBYTE pBuffer = (PBYTE)calloc(textSectionSize, sizeof(BYTE));
+        if (!pBuffer) {
+            printf("Failed to allocate memory for .text section buffer\n");
+            return NULL;
+        }
+
+        // Read the .text section bytes from the target process
+        SIZE_T bytesRead;
+        if (!ReadProcessMemory(hProcess, pTextSectionAddress, pBuffer, textSectionSize, &bytesRead)) {
+            printf("Failed to read .text section bytes. Error: %d\n", GetLastError());
+            free(pBuffer);
+            return NULL;
+        }
+
+        // Ensure all bytes were read
+        if (bytesRead != textSectionSize) {
+            printf("Warning: Only read %zu out of %zu bytes\n", bytesRead, textSectionSize);
+        }
+
+        return pBuffer;
+    }
+
+
+};
+
+
+class PerformanceMonitor {
+private:
+    PDH_HQUERY hQuery = NULL;
+    PDH_HCOUNTER hCounterCPU = NULL, hCounterGPU = NULL, hCounterBattery = NULL;
+    std::vector<PDH_HCOUNTER> hPowerCounters;
+    BOOL hasPowerCounter = TRUE, hasGPUCounter = TRUE, hasBatteryCounter = TRUE;
+    typedef struct _SystemMetrics {
+        DOUBLE cpuUsage;
+        DOUBLE gpuUsage;
+        DOUBLE powerUsage;
+        DOUBLE batteryDischargeRate;
+    } SystemMetrics;
+
+    // 🔹 Function to find all GPU engine utilization counters.
+    // Queries the system for all instances of "GPU Engine" and constructs counter paths for utilization values.
+    std::vector<std::wstring> FindAllGPUCounters() {
+        std::vector<std::wstring> gpuCounters; // Stores the counter paths for GPU engines.
+        DWORD counterListLength = 0, instanceListLength = 0; // Lengths of counter and instance lists.
+        LPWSTR counterList = nullptr, instanceList = nullptr; // Pointers to the lists of counters and instances.
+
+        // First call to `PdhEnumObjectItemsW` to retrieve the required buffer size for counters and instances.
+        PDH_STATUS status = PdhEnumObjectItemsW(
+            nullptr,
+            nullptr,
+            L"GPU Engine",
+            counterList,
+            &counterListLength,
+            instanceList,
+            &instanceListLength,
+            PERF_DETAIL_WIZARD,
+            0
+        );
+
+        // If the function does not return the required data size, log the error and exit.
+        if (status != static_cast<PDH_STATUS>(PDH_MORE_DATA)) { // Fixed signed-unsigned warning.
+            std::wcout << L"[ERROR] Failed to retrieve GPU counter list. Status: " << std::to_wstring(status);
+            return gpuCounters; // Return an empty vector if an error occurs.
+        }
+
+        // Allocate memory for the counter and instance lists using the sizes retrieved earlier.
+        counterList = new WCHAR[counterListLength];
+        instanceList = new WCHAR[instanceListLength];
+
+        // Second call to `PdhEnumObjectItemsW` to retrieve the actual counter and instance data.
+        status = PdhEnumObjectItemsW(
+            nullptr,
+            nullptr,
+            L"GPU Engine",
+            counterList,
+            &counterListLength,
+            instanceList,
+            &instanceListLength,
+            PERF_DETAIL_WIZARD,
+            0
+        );
+
+        // If the function call fails, log the error, clean up memory, and exit.
+        if (status != ERROR_SUCCESS) {
+            std::wcout << L"[ERROR] Failed to enumerate GPU instances. Status: " << std::to_wstring(status);
+            delete[] counterList;
+            delete[] instanceList;
+            return gpuCounters; // Return an empty vector on failure.
+        }
+
+        // Loop through the instance list and construct counter paths for GPU utilization.
+        LPWSTR instance = instanceList;
+        while (*instance) {
+            std::wstring instanceStr(instance); // Convert instance to std::wstring.
+            gpuCounters.push_back(L"\\GPU Engine(" + instanceStr + L")\\Utilization Percentage");
+            instance += wcslen(instance) + 1; // Move to the next instance in the list.
+        }
+
+        // Clean up dynamically allocated memory.
+        delete[] counterList;
+        delete[] instanceList;
+
+        return gpuCounters; // Return the list of GPU counters.
+    }
+
+    // This function checks to ensure that there is a power meter available for running
+    BOOL CheckPowerMeterAvailability() {
+        DWORD counterListSize = 0;
+        DWORD instanceListSize = 0;
+        PDH_STATUS status = PdhEnumObjectItems(NULL, NULL, L"Power Meter", NULL, &counterListSize, NULL, &instanceListSize, PERF_DETAIL_WIZARD, 0);
+
+        if (status == PDH_MORE_DATA) {
+            std::wstring counterList(counterListSize, L'\\0');
+            std::wstring instanceList(instanceListSize, L'\\0');
+
+            status = PdhEnumObjectItems(NULL, NULL, L"Power Meter", &counterList[0], &counterListSize, &instanceList[0], &instanceListSize, PERF_DETAIL_WIZARD, 0);
+
+            if (status == ERROR_SUCCESS) {
+                if (DEBUG) {
+                    std::wcout << L"Power Meter object is available. Counters: " << counterList << std::endl;
+                    std::wcout << L"Instances: " << instanceList << std::endl;
+                }
+                return TRUE;
+            }
+            else {
+                std::wcerr << L"Failed to enumerate Power Meter items. Error: " << status << std::endl;
+                return FALSE;
+            }
+        }
+        else {
+            std::wcerr << L"Power Meter object not available on this system or error: " << status << std::endl;
+            return FALSE;
+        }
+    }
+
+    // Function gets ALL of the Power Meter paths that are available for calling on the system
+    std::vector<std::wstring> GetAllPowerMeterPaths() {
+        DWORD size = 0;
+
+        // Expand the counter path for retrieving information from the power metrics
+        PdhExpandCounterPath(L"\\Power Meter(*)\\Power", NULL, &size);
+        std::wstring buffer(size, L'\\0');
+
+
+        PDH_STATUS status = PdhExpandCounterPath(L"\\Power Meter(*)\\Power", &buffer[0], &size);
+
+        std::vector<std::wstring> paths;
+        if (status == ERROR_SUCCESS) {
+            size_t start = 0, end = 0;
+            while ((end = buffer.find(L'\\0', start)) != std::wstring::npos) {
+
+                paths.push_back(buffer.substr(start, end - start));
+                start = end + 1;
+            }
+        }
+        std::wcout << L"Total available Power Meter paths: " << paths.size() << std::endl;
+        return paths;
+    }
+
+
+    // Function needed to initialize the WMI interface needed for the Base Power Meter Usage
+    IWbemServices* InitializeWMI(VOID) {
+        HRESULT hres;
+        hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+        if (FAILED(hres)) {
+            std::wcerr << L"Failed to initialize COM library. Error code: " << hres << std::endl;
+            return nullptr;
+        }
+
+        hres = CoInitializeSecurity(
+            NULL,
+            -1,
+            NULL,
+            NULL,
+            RPC_C_AUTHN_LEVEL_DEFAULT,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            NULL,
+            EOAC_NONE,
+            NULL
+        );
+        if (FAILED(hres)) {
+            std::wcerr << L"Failed to initialize security. Error code: " << hres << std::endl;
+            CoUninitialize();
+            return nullptr;
+        }
+
+        IWbemLocator* pLoc = NULL;
+        hres = CoCreateInstance(
+            CLSID_WbemLocator,
+            0,
+            CLSCTX_INPROC_SERVER,
+            IID_IWbemLocator,
+            (LPVOID*)&pLoc
+        );
+        if (FAILED(hres)) {
+            std::wcerr << L"Failed to create IWbemLocator object. Error code: " << hres << std::endl;
+            CoUninitialize();
+            return NULL;
+        }
+
+        IWbemServices* pSvc = NULL;
+        hres = pLoc->ConnectServer(
+            _bstr_t(L"ROOT\\CIMV2"),
+            NULL,
+            NULL,
+            0,
+            0,
+            0,
+            0,
+            &pSvc
+        );
+        if (FAILED(hres)) {
+            std::wcerr << L"Failed to connect to WMI. Error code: " << hres << std::endl;
+            pLoc->Release();
+            CoUninitialize();
+            return nullptr;
+        }
+
+        hres = CoSetProxyBlanket(
+            pSvc,
+            RPC_C_AUTHN_WINNT,
+            RPC_C_AUTHZ_NONE,
+            NULL,
+            RPC_C_AUTHN_LEVEL_CALL,
+            RPC_C_IMP_LEVEL_IMPERSONATE,
+            NULL,
+            EOAC_NONE
+        );
+        if (FAILED(hres)) {
+            std::wcerr << L"Failed to set proxy blanket. Error code: " << hres << std::endl;
+            pSvc->Release();
+            pLoc->Release();
+            CoUninitialize();
+            return NULL;
+        }
+
+        pLoc->Release();
+        return pSvc;
+    }
+
+    // Function to shutdown WMI
+    VOID ShutdownWMI(IWbemServices* pSvc) {
+        pSvc->Release();
+        CoUninitialize();
+    }
+
+    // Function to estimate base power usage
+    DOUBLE EstimateBasePowerUsage(IWbemServices* pSvc) {
+        DOUBLE basePowerUsage = 0.0;
+
+        // Query for motherboard (assume 20-30 watts)
+        IEnumWbemClassObject* pEnumerator = nullptr;
+        HRESULT hres = pSvc->ExecQuery(
+            bstr_t("WQL"),
+            bstr_t("SELECT * FROM Win32_BaseBoard"),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            NULL,
+            &pEnumerator
+        );
+        if (SUCCEEDED(hres)) {
+            IWbemClassObject* pclsObj = nullptr;
+            ULONG uReturn = 0;
+            while (pEnumerator) {
+                hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+                if (uReturn == 0) {
+                    break;
+                }
+                // Assume motherboard consumes 25 watts
+                basePowerUsage += 25.0;
+                pclsObj->Release();
+            }
+            pEnumerator->Release();
+        }
+
+        // Query for RAM (assume 2-5 watts per DIMM)
+        pEnumerator = nullptr;
+        hres = pSvc->ExecQuery(
+            bstr_t("WQL"),
+            bstr_t("SELECT * FROM Win32_PhysicalMemory"),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            NULL,
+            &pEnumerator
+        );
+        if (SUCCEEDED(hres)) {
+            IWbemClassObject* pclsObj = nullptr;
+            ULONG uReturn = 0;
+            while (pEnumerator) {
+                hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+                if (uReturn == 0) break;
+
+                // Assume each RAM DIMM consumes 3 watts
+                basePowerUsage += 3.0;
+                pclsObj->Release();
+            }
+            pEnumerator->Release();
+        }
+
+        // Query for disks (assume 5 watts per disk)
+        pEnumerator = NULL;
+        hres = pSvc->ExecQuery(
+            bstr_t("WQL"),
+            bstr_t("SELECT * FROM Win32_DiskDrive"),
+            WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+            NULL,
+            &pEnumerator
+        );
+        if (SUCCEEDED(hres)) {
+            IWbemClassObject* pclsObj = nullptr;
+            ULONG uReturn = 0;
+            while (pEnumerator) {
+                hres = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+                if (uReturn == 0) {
+                    break;
+                }
+
+                // Assume each disk consumes 5 watts
+                basePowerUsage += 5.0;
+                pclsObj->Release();
+            }
+            pEnumerator->Release();
+        }
+
+        // Add power for other components (fans, peripherals, etc.)
+        basePowerUsage += 10.0; // Assume 10 watts for other components
+
+        return basePowerUsage;
+    }
+
+    // Function to estimate power usage in watts
+    DOUBLE EstimatePowerUsage(VOID) {
+        SYSTEM_POWER_STATUS powerStatus;
+        if (!GetSystemPowerStatus(&powerStatus)) {
+            std::cerr << "Failed to get system power status." << std::endl;
+            return -1.0;
+        }
+
+        // Check if the system is running on AC power or battery
+        BOOL isOnACPower = (powerStatus.ACLineStatus == 1);
+
+        // Get CPU usage
+        FILETIME idleTime, kernelTime, userTime;
+        if (!GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+            std::cerr << "Failed to get system times." << std::endl;
+            return -1.0;
+        }
+
+        ULARGE_INTEGER idle, kernel, user;
+        idle.LowPart = idleTime.dwLowDateTime;
+        idle.HighPart = idleTime.dwHighDateTime;
+        kernel.LowPart = kernelTime.dwLowDateTime;
+        kernel.HighPart = kernelTime.dwHighDateTime;
+        user.LowPart = userTime.dwLowDateTime;
+        user.HighPart = userTime.dwHighDateTime;
+
+        ULONGLONG totalTime = (kernel.QuadPart + user.QuadPart);
+        ULONGLONG idleTotalTime = idle.QuadPart;
+
+        static ULONGLONG previousTotalTime = 0;
+        static ULONGLONG previousIdleTime = 0;
+
+        ULONGLONG deltaTime = totalTime - previousTotalTime;
+        ULONGLONG idleDeltaTime = idleTotalTime - previousIdleTime;
+
+        previousTotalTime = totalTime;
+        previousIdleTime = idleTotalTime;
+
+        DOUBLE cpuUsage = 0.0;
+        if (deltaTime != 0) {
+            cpuUsage = 100.0 - (100.0 * idleDeltaTime) / deltaTime;
+        }
+
+        // Estimate power usage based on CPU usage and assumptions
+        DOUBLE basePowerUsage = isOnACPower ? 50.0 : 30.0; // Base power usage in watts
+        DOUBLE cpuPowerUsage = cpuUsage / 100.0 * 100.0;   // Assuming CPU can consume up to 100W at full load
+
+        IWbemServices* pSvc = InitializeWMI();
+        if (pSvc) {
+            basePowerUsage = EstimateBasePowerUsage(pSvc);
+            ShutdownWMI(pSvc);
+        }
+
+
+        DOUBLE estimatedPowerUsage = basePowerUsage + cpuPowerUsage;
+
+        return estimatedPowerUsage;
+    }
+
+
+public:
+    // CLASS CONSTRUCTOR
+    PerformanceMonitor(VOID) {
+        // Initialize PDH Query
+        if (PdhOpenQuery(NULL, 0, &hQuery) != ERROR_SUCCESS) {
+            std::cerr << "Failed to open PDH Query" << std::endl;
+            return;
+        }
+
+        // Add CPU counter
+        if (PdhAddCounter(hQuery, L"\\Processor Information(_Total)\\% Processor Utility", 0, &hCounterCPU) != ERROR_SUCCESS) {
+            std::cerr << "Failed to add CPU counter" << std::endl;
+        }
+        else {
+            std::cout << "Successfully got the CPU Counter" << std::endl;
+        }
+
+        // Add Power Meter counter (if available)
+        if (!CheckPowerMeterAvailability()) {
+            std::cerr << "Power meter monitoring not available. Will use estimated power usage." << std::endl;
+            hasPowerCounter = FALSE;
+        }
+        else {
+            for (CONST auto& path : GetAllPowerMeterPaths()) {
+                PDH_HCOUNTER counter;
+                if (PdhAddCounter(hQuery, path.c_str(), 0, &counter) == ERROR_SUCCESS) {
+                    hPowerCounters.push_back(counter);
+                }
+            }
+
+            if (hPowerCounters.empty()) {
+                std::cerr << "Power meter monitoring not available with given paths. Will use estimated power usage." << std::endl;
+                hasPowerCounter = FALSE;
+            }
+            else {
+                std::cout << "Successfully got the Power Meter" << std::endl;
+            }
+        }
+
+
+        // Add Battery Discharge Rate counter (if available)
+        if (PdhAddCounter(hQuery, L"\\Battery Status(*)\\Discharge Rate", 0, &hCounterBattery) != ERROR_SUCCESS) {
+            std::cerr << "Battery discharge monitoring not available." << std::endl;
+            hasBatteryCounter = FALSE;
+        }
+        else {
+            std::cout << "Successfully got the Battery Discharge rate" << std::endl;
+        }
+
+
+        // Initial data collection
+        PdhCollectQueryData(hQuery);
+    }
+
+    ~PerformanceMonitor(VOID) {
+        PdhCloseQuery(hQuery);
+    }
+
+    // 🔹 Function to monitor total CPU utilization.
+    // Opens a PDH query, adds GPU engine counters, collects utilization data periodically, and logs the results.
     DOUBLE getCPUUsage(VOID) {
         PDH_FMT_COUNTERVALUE counterValue = { 0 };
         PDH_STATUS status = 0;
         PDH_STATUS init = PdhCollectQueryData(hQuery);
 
+        //Create a PDH query to get GPU data
         if (init == ERROR_SUCCESS &&
             (status = PdhGetFormattedCounterValue(hCounterCPU, PDH_FMT_DOUBLE, NULL, &counterValue)) == ERROR_SUCCESS) {
+            
+            if (DEBUG) {
+                std::wcout << L"Total CPU Usage: " << counterValue.doubleValue << L"%\n" << std::flush;
+            }
             return counterValue.doubleValue;
         }
         else {
             if (DEBUG)
             {
-                std::cerr << "Couldn't get the the CPU Usage: " + std::to_string(status) + " " + std::to_string(init) << std::endl;
+                std::wcerr << L"[ERROR] Couldn't get the the CPU Usage: " + std::to_wstring(status) + L" " + std::to_wstring(init) << std::endl;
             }
         }
 
         return -ERROR_INTERNAL_ERROR; // Indicate failure
     }
 
-    VOID GetCpuUsageForProcess(DWORD pid, CONST CHAR* processName) {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-        if (!hProcess) {
-            fprintf(stderr, "Failed to open process %s (PID: %lu).\n", processName, pid);
-            return;
-        }
 
-        ULONGLONG lastCycles, currentCycles;
-        if (!QueryProcessCycleTime(hProcess, &lastCycles)) {
-            fprintf(stderr, "Failed to query process cycles for %s (PID: %lu).\n", processName, pid);
-            CloseHandle(hProcess);
-            return;
-        }
-
-        // Sleep for a very short duration (e.g., 10ms instead of 1s)
-        Sleep(10);
-
-        if (!QueryProcessCycleTime(hProcess, &currentCycles)) {
-            fprintf(stderr, "Failed to query process cycles for %s (PID: %lu).\n", processName, pid);
-            CloseHandle(hProcess);
-            return;
-        }
-
-        ULONGLONG cycleDiff = currentCycles - lastCycles;
-
-        SYSTEM_INFO sysInfo;
-        GetSystemInfo(&sysInfo);
-        DWORD numProcessors = sysInfo.dwNumberOfProcessors;
-
-        printf("Process %s CPU Usage: %.2f%%\n", processName, (cycleDiff / 10000.0) / numProcessors);
-
-        CloseHandle(hProcess);
-    }
-
-    //VOID GetCpuUsageForProcess(DWORD pid, CONST CHAR* processName) {
-    //    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    //    if (!hProcess) {
-    //        fprintf(stderr, "Failed to open process %s (PID: %lu).\n", processName, pid);
-    //        return;
-    //    }
-
-    //    FILETIME ftCreation, ftExit, ftKernel, ftUser;
-    //    ULARGE_INTEGER lastKernel, lastUser, currentKernel, currentUser;
-
-    //    // Initial time capture
-    //    if (!GetProcessTimes(hProcess, &ftCreation, &ftExit, &ftKernel, &ftUser)) {
-    //        fprintf(stderr, "Failed to get process times for %s (PID: %lu).\n", processName, pid);
-    //        CloseHandle(hProcess);
-    //        return;
-    //    }
-
-    //    lastKernel.LowPart = ftKernel.dwLowDateTime;
-    //    lastKernel.HighPart = ftKernel.dwHighDateTime;
-    //    lastUser.LowPart = ftUser.dwLowDateTime;
-    //    lastUser.HighPart = ftUser.dwHighDateTime;
-
-    //    //Sleep(1000); // Wait for 1 second to measure CPU usage
-
-    //    // Capture process times again
-    //    if (!GetProcessTimes(hProcess, &ftCreation, &ftExit, &ftKernel, &ftUser)) {
-    //        fprintf(stderr, "Failed to get process times for %s (PID: %lu).\n", processName, pid);
-    //        CloseHandle(hProcess);
-    //        return;
-    //    }
-
-    //    currentKernel.LowPart = ftKernel.dwLowDateTime;
-    //    currentKernel.HighPart = ftKernel.dwHighDateTime;
-    //    currentUser.LowPart = ftUser.dwLowDateTime;
-    //    currentUser.HighPart = ftUser.dwHighDateTime;
-
-    //    // Calculate CPU usage as a percentage
-    //    ULONGLONG kernelDiff = currentKernel.QuadPart - lastKernel.QuadPart;
-    //    ULONGLONG userDiff = currentUser.QuadPart - lastUser.QuadPart;
-    //    ULONGLONG totalDiff = kernelDiff + userDiff;
-
-    //    SYSTEM_INFO sysInfo;
-    //    GetSystemInfo(&sysInfo);
-    //    DWORD numProcessors = sysInfo.dwNumberOfProcessors;
-
-    //    printf("Process %s CPU Usage: %.2f%%\n", processName, (totalDiff / 10000.0) / numProcessors);
-
-    //    CloseHandle(hProcess);
-    //}
-
-
-
-    std::string GetProcessName(DWORD pid) {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-        if (!hProcess) {
-            return "<Unknown>";  // Return default if process cannot be opened
-        }
-
-        //TCHAR processName[MAX_PATH] = TEXT("<Unknown>");
-        CHAR processName[MAX_PATH] = "<Unknown>";
-
-        // Get process name
-        if (GetModuleBaseNameA(hProcess, NULL, processName, sizeof(processName) / sizeof(CHAR)) == 0) {
-            CloseHandle(hProcess);
-            return "<Unknown>";
-        }
-
-        CloseHandle(hProcess);
-        return std::string(processName);  // Return as std::string
-    }
-
+    // 🔹 Function to monitor total GPU utilization.
+    // Opens a PDH query, adds GPU engine counters, collects utilization data periodically, and returns the results.
     DOUBLE getGPUUsage(VOID) {
-        //if (!hasGPUCounter) {
-        //    return -1;
-        //}
-        //PDH_FMT_COUNTERVALUE counterValue = { 0 };
-        //PDH_STATUS status = 0;
-        //PDH_STATUS init = PdhCollectQueryData(hQuery);
-
-        //(LONG)PDH_INVALID_ARGUMENT;
-
-        //if (PdhCollectQueryData(hQuery) == ERROR_SUCCESS &&
-        //    (status = PdhGetFormattedCounterValue(hCounterGPU, PDH_FMT_DOUBLE, NULL, &counterValue)) == ERROR_SUCCESS) {
-        //    return counterValue.doubleValue;
-        //}
-        //else {
-        //    if (DEBUG)
-        //    {
-        //        std::cerr << "Couldn't get the the GPU Usage: " + std::to_string(status) + " " + std::to_string(init) << std::endl;
-        //    }
-
-        //}
-
-        //return -ERROR_INTERNAL_ERROR;
-    // PowerShell command to get total GPU usage
-
-
-        std::wstring psCommand = LR"(
-        $GpuUseTotal = (((Get-Counter \"\GPU Engine(*engtype_3D)\Utilization Percentage\").CounterSamples | where CookedValue).CookedValue | measure -sum).sum;
-        Write-Output "$([math]::Round($GpuUseTotal,2))%"
-    )";
-
-        std::string gpuUsage = RunPowerShellCommand(psCommand);
-
-        // Remove any trailing whitespace, newlines, or percentage symbols
-        gpuUsage.erase(std::remove_if(gpuUsage.begin(), gpuUsage.end(), [](unsigned char c) {
-            return std::isspace(c) || c == '%';
-            }), gpuUsage.end());
-
-        // Convert to double
-        double gpuUsageValue = 0.0;
-        try {
-            gpuUsageValue = std::stod(gpuUsage);
-        }
-        catch (const std::exception& e) {
-            std::cerr << "❌ Error converting GPU usage to double: " << e.what() << std::endl;
-            return  -ERROR_INTERNAL_ERROR;
+        // Retrieve all GPU engine counters.
+        std::vector<std::wstring> counterPaths = FindAllGPUCounters();
+        if (counterPaths.empty()) {
+            wprintf(L"[ERROR] No GPU counters found.\n");
+            return 0.0; // Exit if no counters are found.
         }
 
-        return gpuUsageValue;
-        
-    }
+        // Create a PDH query to collect GPU data.
+        PDH_HQUERY hQuery;
+        if (PdhOpenQueryW(nullptr, 0, &hQuery) != ERROR_SUCCESS) {
+            wprintf(L"[ERROR] Failed to open PDH query.\n");
+            return 0.0; // Exit on query initialization failure.
+        }
 
-    DOUBLE getPowerUsage(VOID) {
-        if (!hasPowerCounter) {
-            return -1;
-        }
-        PDH_FMT_COUNTERVALUE counterValue = { 0 };
-        PDH_STATUS status = 0;
-        PDH_STATUS init = PdhCollectQueryData(hQuery);
-        if (PdhCollectQueryData(hQuery) == ERROR_SUCCESS &&
-            (status = PdhGetFormattedCounterValue(hCounterPower, PDH_FMT_DOUBLE, NULL, &counterValue)) == ERROR_SUCCESS) {
-            return counterValue.doubleValue;
-        }
-        else {
-            if (DEBUG)
-            {
-                std::cerr << "Couldn't get the the Power Usage: " + std::to_string(status) + " " + std::to_string(init) << std::endl;
+        // Add each counter path to the PDH query.
+        std::vector<PDH_HCOUNTER> hCounters; // Store handles for counters.
+        for (CONST auto& counterPath : counterPaths) {
+            PDH_HCOUNTER hCounter;
+            if (PdhAddCounterW(hQuery, counterPath.c_str(), 0, &hCounter) == ERROR_SUCCESS) {
+                hCounters.push_back(hCounter); // Add valid counters to the list.
+            }
+            else {
+                std::wcout <<L"[WARN] Failed to add counter: " << counterPath << std::endl;
             }
         }
 
-        return -ERROR_INTERNAL_ERROR;
+        // If no valid counters are added, terminate monitoring.
+        if (hCounters.empty()) {
+            wprintf(L"[ERROR] No valid counters added to the PDH query.\n");
+            PdhCloseQuery(hQuery);
+            return 0.0;
+        }
+
+        if (PdhCollectQueryData(hQuery) != ERROR_SUCCESS) {
+            wprintf(L"[ERROR] Failed to collect GPU query data.\n");
+            return 0.0;
+        }
+
+        DOUBLE totalGPUUsage = 0.0; // Total utilization for all engines.
+
+        // Retrieve utilization data for each GPU engine.
+        for (SIZE_T i = 0; i < hCounters.size(); ++i) {
+            PDH_FMT_COUNTERVALUE counterVal;
+            if (PdhGetFormattedCounterValue(hCounters[i], PDH_FMT_DOUBLE, nullptr, &counterVal) == ERROR_SUCCESS) {
+                totalGPUUsage += counterVal.doubleValue; // Sum up utilization percentages.
+            }
+            else {
+                if (DEBUG) {
+                    std::wcout << L"[WARN] Failed to retrieve counter value for: " << counterPaths[i] << std::endl;
+                }
+            }
+        }
+
+        // Display and log the total utilization percentage.
+        if (DEBUG) {
+            std::wcout << L"Total GPU Utilization (All Engines): " << totalGPUUsage << L"%\n" << std::flush;
+        }
+
+        std::this_thread::sleep_for(std::chrono::seconds(2)); // Pause for 2 seconds before the next data collection.
+
+        // Cleanup: Close the PDH query and free resources.
+        PdhCloseQuery(hQuery);
+        return totalGPUUsage;
+    }
+
+    // 🔹 Function to monitor total Power usage.
+    // Opens a PDH query, adds GPU engine counters, collects utilization data periodically, and returns the results.
+
+    DOUBLE getPowerUsage(VOID) {
+        
+        if (!hasPowerCounter) {
+            return EstimatePowerUsage();
+        }
+
+        PDH_STATUS status = PdhCollectQueryData(hQuery);
+        DOUBLE totalPower = 0.0;
+        if (status == ERROR_SUCCESS) {
+            for (auto& counter : hPowerCounters) {
+                PDH_FMT_COUNTERVALUE counterValue;
+                if (PdhGetFormattedCounterValue(counter, PDH_FMT_DOUBLE, NULL, &counterValue) == ERROR_SUCCESS) {
+                    totalPower += counterValue.doubleValue;
+                }
+            }
+            return totalPower;
+        }
+        else {
+            std::wcerr << L"[ERROR] Failed to retrieve power usage. PDH Status: " << status << std::endl;
+            return EstimatePowerUsage();
+        }
+
     }
 
     DOUBLE getBatteryDischargeRate(VOID) {
@@ -399,14 +849,14 @@ public:
             return counterValue.doubleValue;
         }
         else {
-            if (DEBUG)
-            {
-                std::cerr << "Couldn't get the the Battery Usage: " + std::to_string(status) + " " + std::to_string(init) << std::endl;
+            if (DEBUG) {
+                std::wcerr << L"Couldn't get the the Battery Usage: " + std::to_wstring(status) + L" " + std::to_wstring(init) << std::endl;
             }
         }
 
         return -ERROR_INTERNAL_ERROR;
     }
+
 
     SystemMetrics collectMetrics() {
         return { getCPUUsage(), getGPUUsage(), getPowerUsage(), getBatteryDischargeRate() };
@@ -478,175 +928,204 @@ public:
         }
         return FALSE;
     }
+
+
 };
 
 
+class ProcessMonitor {
 
-// Function to execute PowerShell command and return output as a string
-std::string RunPowerShellCommand(const std::wstring& command) {
-    HANDLE hReadPipe, hWritePipe;
-    SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
+private:
+    // 🔹 Function to find all GPU counters for a given process ID
+    std::vector<std::wstring> FindAllGPUCountersForPID(DWORD pid) {
+        std::vector<std::wstring> gpuCounters;
+        DWORD counterListLength = 0, instanceListLength = 0;
+        LPWSTR counterList = nullptr, instanceList = nullptr;
 
-    // Create Pipe for capturing PowerShell output
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        std::cerr << "❌ Failed to create pipe.\n";
-        return "";
+        // Enumrate all instances of GPU engine 
+        PDH_STATUS status = PdhEnumObjectItemsW(
+            nullptr,
+            nullptr,
+            L"GPU Engine",
+            counterList,
+            &counterListLength,
+            instanceList,
+            &instanceListLength,
+            PERF_DETAIL_WIZARD,
+            0
+        );
+
+        if (status != PDH_MORE_DATA) {
+            std::wcerr << L"[ERROR] Failed to retrieve GPU counter list. Status: " << status << L"\n" << std::flush;
+            return gpuCounters;
+        }
+
+        counterList = new WCHAR[counterListLength];
+        instanceList = new WCHAR[instanceListLength];
+
+        // Enumrate all instances of GPU engine 
+        status = PdhEnumObjectItemsW(
+            nullptr,
+            nullptr,
+            L"GPU Engine",
+            counterList,
+            &counterListLength,
+            instanceList,
+            &instanceListLength,
+            PERF_DETAIL_WIZARD,
+            0
+        );
+
+        if (status != ERROR_SUCCESS) {
+            std::wcerr << L"[ERROR] Failed to enumerate GPU instances. Status: " << status << L"\n" << std::flush;
+            delete[] counterList;
+            delete[] instanceList;
+            return gpuCounters;
+        }
+
+        LPWSTR instance = instanceList;
+        std::wcout << L"Have a list of counters that may work for pid " << pid << std::endl;
+        while (*instance) {
+            std::wstring instanceStr(instance);
+            if (instanceStr.find(L"pid_" + std::to_wstring(pid)) != std::wstring::npos) {
+                gpuCounters.push_back(L"\\GPU Engine(" + instanceStr + L")\\Utilization Percentage");
+            }
+            instance += wcslen(instance) + sizeof(WCHAR);
+        }
+
+        delete[] counterList;
+        delete[] instanceList;
+        return gpuCounters;
+    }
+public:
+    // 🔹 Function to find GPU % Usage given a process
+    DOUBLE GetGpuUsageForProcess(DWORD pid, CONST WCHAR * processName) {
+        
+        // retrieve GPU counter instances for PID
+        std::vector<std::wstring> counterPaths = FindAllGPUCountersForPID(pid);
+        if (counterPaths.empty()) {
+            if (!DEBUG) {
+                fwprintf(stderr, L"[WARN] No GPU counters found for %s (PID: %lu).\n", processName, pid);
+            }
+            return 0.0;
+        }
+
+        // Query PDH metrics
+        PDH_HQUERY hQuery;
+        if (PdhOpenQueryW(nullptr, 0, &hQuery) != ERROR_SUCCESS) {
+            std::wcerr << L"[ERROR] Failed to open PDH query.\n" << std::flush;
+            return 0.0;
+        }
+
+        std::vector<PDH_HCOUNTER> hCounters;
+        for (const auto& counterPath : counterPaths) {
+            PDH_HCOUNTER hCounter;
+            if (PdhAddCounterW(hQuery, counterPath.c_str(), 0, &hCounter) == ERROR_SUCCESS) {
+                hCounters.push_back(hCounter);
+            }
+            else {
+                std::wcerr << L"[WARN] Failed to add counter: " << counterPath << L"\n" << std::flush;
+            }
+        }
+        
+        // check to see if list is empty
+        if (hCounters.empty()) {
+            std::wcerr << L"[ERROR] No valid counters added. Exiting...\n" << std::flush;
+            PdhCloseQuery(hQuery);
+            return 0.0;
+        }
+
+        if (PdhCollectQueryData(hQuery) != ERROR_SUCCESS) {
+            std::wcerr << L"[ERROR] Failed to collect query data.\n" << std::flush;
+            return 0.0;
+        }
+
+        DOUBLE totalPidGPUUsage = 0.0; // Total utilization for all engines.
+
+        for (SIZE_T i = 0; i < hCounters.size(); ++i) {
+            PDH_FMT_COUNTERVALUE counterVal;
+            if (PdhGetFormattedCounterValue(hCounters[i], PDH_FMT_DOUBLE, nullptr, &counterVal) == ERROR_SUCCESS) {
+                std::wcout << counterPaths[i] << L": " << counterVal.doubleValue << L"%\n" << std::flush;
+                totalPidGPUUsage += counterVal.doubleValue;
+            }
+            else {
+                std::wcerr << L"[ERROR] Failed to retrieve counter value for: " << counterPaths[i] << L"\n" << std::flush;
+            }
+        }
+
+        // Display and log the total utilization percentage.
+        wprintf(L"Total GPU Utilization (All Engines) for %s: %.2f%%\n", processName, totalPidGPUUsage);
+
+
+        std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
+
+        PdhCloseQuery(hQuery);
+        //std::wcout << L"[INFO] GPU monitoring stopped.\n" << std::flush;
+        return totalPidGPUUsage;
     }
 
-    // PowerShell execution command
-    std::wstring psCommand = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"" + command + L"\"";
+    // Function to find CPU % usage for given PID
+    DOUBLE GetCpuUsageForProcess(DWORD pid, CONST WCHAR * processName) {
 
-    std::wcout << psCommand << std::endl;
+        // Attempt to open process to query information
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (!hProcess) {
+            fwprintf(stderr, L"[ERROR] Failed to open process %s (PID: %lu).\n", processName, pid);
+            return 0.0;
+        }
 
-    // Set up the process startup info
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    si.dwFlags |= STARTF_USESTDHANDLES;
+        ULONGLONG lastCycles, currentCycles;
 
-    ZeroMemory(&pi, sizeof(pi));
+        // Get CPU Cycles for this process (initial)
+        if (!QueryProcessCycleTime(hProcess, &lastCycles)) {
+            fwprintf(stderr, L"[ERROR] Failed to query process cycles for %s (PID: %lu).\n", processName, pid);
+            CloseHandle(hProcess);
+            return 0.0;
+        }
 
-    // Start PowerShell process
-    if (!CreateProcessW(NULL, &psCommand[0], NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        std::cerr << "❌ Failed to start PowerShell.\n";
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return "";
+        // Sleep for a very short duration (10ms) for update in data
+        Sleep(10);
+
+        // Get CPU Cycles for this process (final)
+        if (!QueryProcessCycleTime(hProcess, &currentCycles)) {
+            fwprintf(stderr, L"[ERROR] Failed to query process cycles for %s (PID: %lu).\n", processName, pid);
+            CloseHandle(hProcess);
+            return 0.0;
+        }
+
+        ULONGLONG cycleDiff = currentCycles - lastCycles;
+
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+        DWORD numProcessors = sysInfo.dwNumberOfProcessors;
+
+        wprintf(L"Total Process CPU Usage for %s: %.2f%%\n", processName, (cycleDiff / 10000.0) / numProcessors);
+
+        CloseHandle(hProcess);
+
+        std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
+        
+        return (cycleDiff / 10000.0) / numProcessors;
     }
 
-    // Close the write pipe handle as it's no longer needed
-    CloseHandle(hWritePipe);
+};
 
-    // Read PowerShell output
-    std::string output;
-    char buffer[4096];
-    DWORD bytesRead;
-    while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
-        buffer[bytesRead] = '\0';
-        output += buffer;
-    }
-
-    // Cleanup
-    CloseHandle(hReadPipe);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return output;
-}
-
-DOUBLE GetGpuUsageForProcess(DWORD pid, CONST CHAR* processName) {
-    PDH_HQUERY query;
-    PDH_HCOUNTER gpuCounter;
-    PDH_FMT_COUNTERVALUE counterValue;
-    PDH_STATUS status;
-
-    // Format GPU usage counter path dynamically for the given PID
-    TCHAR counterPath[256];
-    _stprintf_s(counterPath, TEXT("\\GPU Engine(pid_$(%u)*engtype_3D)\\Utilization Percentage"), pid);
-
-    // Open a PDH query
-    if (PdhOpenQuery(NULL, 0, &query) != ERROR_SUCCESS) {
-        std::cerr << "❌ Failed to open PDH query.\n";
-        return -1.0;
-    }
-
-    // Add GPU Engine Utilization counter for the specific process
-    status = PdhAddCounter(query, counterPath, 0, &gpuCounter);
-    if (status != ERROR_SUCCESS) {
-        std::cerr << "❌ Failed to add GPU counter. Error: 0x" << std::hex << status << "\n";
-        PdhCloseQuery(query);
-        return -1.0;
-    }
-
-    // Allow PDH counters some time to collect valid data
-    //Sleep(1000);
-
-    // Collect query data
-    status = PdhCollectQueryData(query);
-    if (status != ERROR_SUCCESS) {
-        std::cerr << "❌ Failed to collect PDH query data. Error: 0x" << std::hex << status << "\n";
-        PdhCloseQuery(query);
-        return -1.0;
-    }
-
-    // Retrieve formatted counter value
-    status = PdhGetFormattedCounterValue(gpuCounter, PDH_FMT_DOUBLE, NULL, &counterValue);
-    if (status == ERROR_SUCCESS) {
-        std::cout << "🎮 GPU Usage for PID " << pid << ": " << counterValue.doubleValue << "%\n";
-    }
-    else {
-        std::cerr << "❌ Failed to retrieve GPU usage counter value. Error: 0x" << std::hex << status << "\n";
-    }
-
-    // Cleanup
-    PdhCloseQuery(query);
-
-    return counterValue.doubleValue;
-}
-
-//VOID GetGpuUsageForProcess(DWORD pid, CONST CHAR * processName) {
-//    PDH_HQUERY query;
-//    PDH_HCOUNTER gpuCounter;
-//    PDH_FMT_COUNTERVALUE counterValue;
-//    TCHAR counterPath[256];
-//    PDH_STATUS status;
-//
-//    // Open a PDH query
-//    if (PdhOpenQuery(NULL, 0, &query) != ERROR_SUCCESS) {
-//        fprintf(stderr, "Failed to open PDH query.\n");
-//        return;
-//    }
-//
-//    // Use StringCchPrintf instead of deprecated swprintf/_stprintf
-//    HRESULT hr = StringCchPrintf(counterPath, ARRAYSIZE(counterPath), TEXT("\\GPU Engine(pid_%u*engtype_3D)\\Utilization Percentage"), pid);
-//    if (FAILED(hr)) {
-//        fprintf(stderr, "Failed to format counter path.\n");
-//        PdhCloseQuery(query);
-//        return;
-//    }
-//
-//    // Add GPU Engine Utilization counter for the process
-//    status = PdhAddCounter(query, counterPath, 0, &gpuCounter);
-//    if (status != ERROR_SUCCESS) {
-//        fprintf(stderr, "Failed to add GPU engine counter. Error: 0x%x\n", status);
-//        PdhCloseQuery(query);
-//        return;
-//    }
-//
-//    // Collect query data
-//    if (PdhCollectQueryData(query) != ERROR_SUCCESS) {
-//        fprintf(stderr, "Failed to collect query data.- %d\n", GetLastError());
-//        PdhCloseQuery(query);
-//        return;
-//    }
-//
-//    // Get GPU usage
-//    if (PdhGetFormattedCounterValue(gpuCounter, PDH_FMT_DOUBLE, NULL, &counterValue) == ERROR_SUCCESS) {
-//        printf("Process %s GPU Engine Usage: %.2f%%\n", processName, counterValue.doubleValue);
-//    }
-//    else {
-//        fprintf(stderr, "Failed to get GPU usage counter value.\n");
-//    }
-//
-//    // Close the PDH query
-//    PdhCloseQuery(query);
-//}
 
 
 INT systemtest() {
 
     PerformanceMonitor monitor;
+    ProcessMonitor procmon;
     CCommunication comms;
+    Utils util;
 
     BOOL results = comms.Initialize();
     if (!results) {
         printf("Issue starting driver. Please ensure driver is correctly installed.");
         return ERROR_INVALID_HANDLE;
     }
+
+    monitor.isConsistentlyHighUsage();
 
     if (TRUE){
     //if (monitor.isConsistentlyHighUsage()) {
@@ -659,9 +1138,33 @@ INT systemtest() {
         for (DWORD idx = 0; idx < comms.ProcessList->size; idx++) {
             DWORD pid = (DWORD)comms.ProcessList->processes[idx].ProcessID;
             if (pid > 0) {
-                std::string processName = monitor.GetProcessName(pid);
+                std::wstring processName = util.GetProcessName(pid);
                 //printf("%Process name: %s\n", processName.c_str());
-                monitor.GetCpuUsageForProcess(pid, processName.c_str());
+                DOUBLE pid_gpu_usage = procmon.GetGpuUsageForProcess(pid, processName.c_str());
+                DOUBLE pid_cpu_usage = procmon.GetCpuUsageForProcess(pid, processName.c_str());
+                if (pid_gpu_usage > HIGH_GPU_PID_THRESHOLD && pid_cpu_usage > HIGH_CPU_PID_THRESOLD) {
+
+                    PVOID pid_base_address = comms.GetImageBase(pid)->ImageBase;
+                    PVOID pid_text_address = NULL;
+                    SIZE_T text_size = 0;
+                    PBYTE text_memory = NULL;
+                    util.GetProcessTextSectionInfo(pid, pid_base_address, &pid_text_address, &text_size, &text_memory);
+
+                    // Call code for determining the text_memory is malicious
+
+
+                    if (/*CONDITION*/ TRUE) {
+                        if (!util.TerminateProcessByPID(pid)) {
+                            BOOL result = comms.KillProcess(pid);
+                            if (!result) {
+                                wprintf(L"Failed to kill process %d. Please investigate this.\n", pid);
+                            }
+                        }
+                        else {
+                            wprintf(L"Successfully termianted process %d!", pid);
+                        }
+                    }
+                }
             }
         }
 
@@ -670,138 +1173,40 @@ INT systemtest() {
     return ERROR_SUCCESS;
 }
 
-// Function to read bytes from the .text section of another process
-BYTE* ReadTextSectionBytes(HANDLE hProcess, PVOID pTextSectionAddress, SIZE_T textSectionSize) {
-    // Allocate a buffer to hold the .text section bytes
-    PBYTE pBuffer = (PBYTE)calloc(textSectionSize, sizeof(BYTE));
-    if (!pBuffer) {
-        printf("Failed to allocate memory for .text section buffer\n");
-        return NULL;
-    }
-
-    // Read the .text section bytes from the target process
-    SIZE_T bytesRead;
-    if (!ReadProcessMemory(hProcess, pTextSectionAddress, pBuffer, textSectionSize, &bytesRead)) {
-        printf("Failed to read .text section bytes. Error: %d\n", GetLastError());
-        free(pBuffer);
-        return NULL;
-    }
-
-    // Ensure all bytes were read
-    if (bytesRead != textSectionSize) {
-        printf("Warning: Only read %zu out of %zu bytes\n", bytesRead, textSectionSize);
-    }
-
-    return pBuffer;
-}
-
-// Function to read memory from another process
-BOOL ReadProcessMemorySafe(HANDLE hProcess, LPCVOID lpBaseAddress, LPVOID lpBuffer, SIZE_T nSize) {
-    SIZE_T bytesRead;
-    if (!ReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, nSize, &bytesRead) || bytesRead != nSize) {
-        printf("Failed to read memory at address 0x%p. Error: %d\n", lpBaseAddress, GetLastError());
-        return FALSE;
-    }
-    return TRUE;
-}
-
-// Function to get the .text section address and size of another process
-BOOL GetProcessTextSectionInfo(DWORD pid, PVOID pBaseAddress, PVOID* pTextSectionAddress, SIZE_T* pTextSectionSize, PBYTE* pTextMem) {
-    // Open the target process
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (!hProcess) {
-        printf("Failed to open process (PID: %d). Error: %d\n", pid, GetLastError());
-        return FALSE;
-    }
-
-    // Read the DOS header
-    IMAGE_DOS_HEADER dosHeader;
-    if (!ReadProcessMemorySafe(hProcess, pBaseAddress, &dosHeader, sizeof(dosHeader))) {
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    // Validate the DOS header
-    if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
-        printf("Invalid DOS header\n");
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    // Read the NT headers
-    IMAGE_NT_HEADERS ntHeaders;
-    if (!ReadProcessMemorySafe(hProcess, (PBYTE)pBaseAddress + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders))) {
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    // Validate the NT headers
-    if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
-        printf("Invalid NT headers\n");
-        CloseHandle(hProcess);
-        return FALSE;
-    }
-
-    // Read the section headers
-    IMAGE_SECTION_HEADER sectionHeader;
-    DWORD sectionOffset = dosHeader.e_lfanew + sizeof(ntHeaders.Signature) + sizeof(ntHeaders.FileHeader) + ntHeaders.FileHeader.SizeOfOptionalHeader;
-
-    // Iterate through the section table to find the .text section
-    for (DWORD i = 0; i < ntHeaders.FileHeader.NumberOfSections; i++) {
-        if (!ReadProcessMemorySafe(hProcess, (PBYTE)pBaseAddress + sectionOffset + (i * sizeof(sectionHeader)), &sectionHeader, sizeof(sectionHeader))) {
-            CloseHandle(hProcess);
-            return FALSE;
-        }
-
-        // Check if this is the .text section
-        if (strcmp((char*)sectionHeader.Name, ".text") == 0) {
-            // Calculate the .text section address and size
-            *pTextSectionAddress = (PBYTE)pBaseAddress + sectionHeader.VirtualAddress;
-            *pTextSectionSize = sectionHeader.Misc.VirtualSize;
-            *pTextMem = ReadTextSectionBytes(hProcess, *pTextSectionAddress, *pTextSectionSize);
-            CloseHandle(hProcess);
-            return TRUE;
-        }
-    }
-
-    // .text section not found
-    printf(".text section not found for process %d\n", pid);
-    CloseHandle(hProcess);
-    return FALSE;
-}
 
 // Main function
 INT main(INT argc, LPSTR * argv) {
 
-    CCommunication comms;
-    PerformanceMonitor monitor;
+    //CCommunication comms;
+    //PerformanceMonitor monitor;
+    //Utils util;
 
-    if (argc < 2) {
-        printf("Too little arguments - therefore exiting.\n");
-        return -1;
-    }
+    //if (argc < 2) {
+    //    printf("Too little arguments - therefore exiting.\n");
+    //    return -1;
+    //}
 
-    BOOL results = comms.Initialize();
-    if (!results) {
-        return -1;
-    }
+    //BOOL results = comms.Initialize();
+    //if (!results) {
+    //    return -1;
+    //}
 
-    SIZE_T edge_text_size = 0;
-    PVOID edge_text_address = NULL;
+    //SIZE_T edge_text_size = 0;
+    //PVOID edge_text_address = NULL;
 
-    PVOID edge_address = comms.GetImageBase(std::stoi(argv[1]))->ImageBase;
-    PBYTE edge_text_memory = NULL;
+    //PVOID edge_address = comms.GetImageBase(std::stoi(argv[1]))->ImageBase;
+    //PBYTE edge_text_memory = NULL;
 
-    GetProcessTextSectionInfo(std::stoi(argv[1]), edge_address, &edge_text_address, &edge_text_size, &edge_text_memory);
-    free(edge_text_memory);
+    //util.GetProcessTextSectionInfo(std::stoi(argv[1]), edge_address, &edge_text_address, &edge_text_size, &edge_text_memory);
+    //free(edge_text_memory);
 
-    comms.KillProcess(std::stoi(argv[1]));
+    //comms.KillProcess(std::stoi(argv[1]));
 
-    printf("%d is the text size\n", edge_text_size);
+    //printf("%d is the text size\n", edge_text_size);
 
 
 
-   //return systemtest();
+   return systemtest();
 }
 
 
