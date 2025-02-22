@@ -12,6 +12,8 @@
 #include <comdef.h>
 #include <Wbemidl.h>
 #include <psapi.h>
+#include <tlhelp32.h> 
+
 
 #include <iostream>
 #include <string>
@@ -290,6 +292,80 @@ public:
         return pBuffer;
     }
 
+    // Function to retrieve the full executable path for a given PID.
+// Returns true if successful, with the path stored in szFileName.
+    BOOL GetProcessExecutablePath(DWORD pid, LPTSTR szFileName, DWORD cchFileName) {
+        // Open the process with rights to query information and read memory.
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        if (hProcess == NULL) {
+            _tprintf(_T("Error: Unable to open process %u. Error code: %u\n"), pid, GetLastError());
+            return FALSE;
+        }
+
+        // Query the full process image name.
+        if (!QueryFullProcessImageName(hProcess, 0, szFileName, &cchFileName)) {
+            _tprintf(_T("Error: Unable to query process image name for PID %u. Error code: %u\n"), pid, GetLastError());
+            CloseHandle(hProcess);
+            return FALSE;
+        }
+        CloseHandle(hProcess);
+        return TRUE;
+    }
+
+    // Function to delete a file given its full path.
+// If DeleteFile fails (e.g. file is locked), it schedules deletion on next reboot.
+    BOOL DeleteFileWithFallback(LPCTSTR szFileName) {
+        if (DeleteFile(szFileName)) {
+            _tprintf(_T("Success: File deleted successfully.\n"));
+            return TRUE;
+        }
+        else {
+            DWORD dwError = GetLastError();
+            _tprintf(_T("Warning: DeleteFile failed with error code %u. Attempting to schedule deletion on reboot...\n"), dwError);
+            if (MoveFileEx(szFileName, NULL, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+                _tprintf(_T("Info: File scheduled for deletion on next reboot.\n"));
+                return TRUE;
+            }
+            else {
+                _tprintf(_T("Error: Failed to schedule file deletion. Error code: %u\n"), GetLastError());
+                return FALSE;
+            }
+        }
+    }
+
+    DWORD getpid() {
+        return GetCurrentProcessId();
+    }
+
+    DWORD getppid()
+    {
+        HANDLE hSnapshot;
+        PROCESSENTRY32 pe32;
+        DWORD ppid = 0, pid = GetCurrentProcessId();
+
+        hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        __try {
+            if (hSnapshot == INVALID_HANDLE_VALUE) __leave;
+
+            ZeroMemory(&pe32, sizeof(pe32));
+            pe32.dwSize = sizeof(pe32);
+            if (!Process32First(hSnapshot, &pe32)) __leave;
+
+            do {
+                if (pe32.th32ProcessID == pid) {
+                    ppid = pe32.th32ParentProcessID;
+                    break;
+                }
+            } while (Process32Next(hSnapshot, &pe32));
+
+        }
+        __finally {
+            if (hSnapshot != INVALID_HANDLE_VALUE) {
+                CloseHandle(hSnapshot);
+            }
+        }
+        return ppid;
+    }
 
 };
 
@@ -891,23 +967,23 @@ public:
                 std::cout << "Battery Discharge Rate: " << metrics.batteryDischargeRate << " mW" << std::endl;
             }
 
-            bool isHighUsage = false;
+            bool isHighUsage = FALSE;
 
             if (metrics.cpuUsage > HIGH_CPU_THRESHOLD) {
                 std::cout << "[ALERT] High CPU usage detected!" << std::endl;
-                isHighUsage = true;
+                isHighUsage = TRUE;
             }
             if (metrics.gpuUsage > HIGH_GPU_THRESHOLD) {
                 std::cout << "[ALERT] High GPU usage detected!" << std::endl;
-                isHighUsage = true;
+                isHighUsage = TRUE;
             }
             if (metrics.powerUsage > HIGH_POWER_THRESHOLD) {
                 std::cout << "[ALERT] High Power usage detected!" << std::endl;
-                isHighUsage = true;
+                isHighUsage = TRUE;
             }
             if (metrics.batteryDischargeRate < HIGH_BATTERY_DRAIN) {
                 std::cout << "[ALERT] High battery discharge detected!" << std::endl;
-                isHighUsage = true;
+                isHighUsage = TRUE;
             }
 
 
@@ -1018,7 +1094,7 @@ public:
         }
 
         std::vector<PDH_HCOUNTER> hCounters;
-        for (const auto& counterPath : counterPaths) {
+        for (CONST auto& counterPath : counterPaths) {
             PDH_HCOUNTER hCounter;
             if (PdhAddCounterW(hQuery, counterPath.c_str(), 0, &hCounter) == ERROR_SUCCESS) {
                 hCounters.push_back(hCounter);
@@ -1057,7 +1133,8 @@ public:
         wprintf(L"Total GPU Utilization (All Engines) for %s: %.2f%%\n", processName, totalPidGPUUsage);
 
 
-        std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
+        Sleep(10);
+        //std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
 
         PdhCloseQuery(hQuery);
         //std::wcout << L"[INFO] GPU monitoring stopped.\n" << std::flush;
@@ -1103,7 +1180,8 @@ public:
 
         CloseHandle(hProcess);
 
-        std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
+        Sleep(100);
+        //std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
         
         return (cycleDiff / 10000.0) / numProcessors;
     }
@@ -1111,67 +1189,87 @@ public:
 };
 
 
+class PowerExpOrchestrator {
+public:
+    INT systemtest() {
 
-INT systemtest() {
+        PerformanceMonitor monitor;
+        ProcessMonitor procmon;
+        CCommunication comms;
+        Utils util;
 
-    PerformanceMonitor monitor;
-    ProcessMonitor procmon;
-    CCommunication comms;
-    Utils util;
-
-    BOOL results = comms.Initialize();
-    if (!results) {
-        printf("Issue starting driver. Please ensure driver is correctly installed.");
-        return ERROR_INVALID_HANDLE;
-    }
-
-    monitor.isConsistentlyHighUsage();
-
-    if (TRUE){
-    //if (monitor.isConsistentlyHighUsage()) {
-        results = comms.GetProcesses();
-        if (!results || sizeof(comms.ProcessList) == 0) {
-            printf("Issue getting processes associated to the system. Therefore exiting.");
-            return ERROR_ACCESS_DENIED;
+        BOOL results = comms.Initialize();
+        if (!results) {
+            printf("Issue starting driver. Please ensure driver is correctly installed.");
+            return ERROR_INVALID_HANDLE;
         }
 
-        for (DWORD idx = 0; idx < comms.ProcessList->size; idx++) {
-            DWORD pid = (DWORD)comms.ProcessList->processes[idx].ProcessID;
-            if (pid > 0) {
-                std::wstring processName = util.GetProcessName(pid);
-                //printf("%Process name: %s\n", processName.c_str());
-                DOUBLE pid_gpu_usage = procmon.GetGpuUsageForProcess(pid, processName.c_str());
-                DOUBLE pid_cpu_usage = procmon.GetCpuUsageForProcess(pid, processName.c_str());
-                if (pid_gpu_usage > HIGH_GPU_PID_THRESHOLD && pid_cpu_usage > HIGH_CPU_PID_THRESOLD) {
+        monitor.isConsistentlyHighUsage();
 
-                    PVOID pid_base_address = comms.GetImageBase(pid)->ImageBase;
-                    PVOID pid_text_address = NULL;
-                    SIZE_T text_size = 0;
-                    PBYTE text_memory = NULL;
-                    util.GetProcessTextSectionInfo(pid, pid_base_address, &pid_text_address, &text_size, &text_memory);
+        if (TRUE) {
+            //if (monitor.isConsistentlyHighUsage()) {
+            results = comms.GetProcesses();
+            if (!results || sizeof(comms.ProcessList) == 0) {
+                printf("Issue getting processes associated to the system. Therefore exiting.");
+                return ERROR_ACCESS_DENIED;
+            }
 
-                    // Call code for determining the text_memory is malicious
+            for (DWORD idx = 0; idx < comms.ProcessList->size; idx++) {
+                DWORD pid = (DWORD)comms.ProcessList->processes[idx].ProcessID;
+                if (pid == util.getpid() || pid == util.getppid()) {
+                    continue;
+                }
+                else if (pid > 0) {
+                    std::wstring processName = util.GetProcessName(pid);
+                    if (DEBUG) {
+                        std::wcout << L"Process name: " << processName << std::endl;
+                    }
+                    std::wcout << std::endl;
+                    DOUBLE pid_gpu_usage = procmon.GetGpuUsageForProcess(pid, processName.c_str());
+                    DOUBLE pid_cpu_usage = procmon.GetCpuUsageForProcess(pid, processName.c_str());
+                    std::wcout << std::endl;
+                    if (pid_gpu_usage > HIGH_GPU_PID_THRESHOLD || pid_cpu_usage > HIGH_CPU_PID_THRESOLD) {
+
+                        std::wcout << L"Pid " + pid << L" is a potentially malicious process that needs investigation. Determining if malicious.\n";
+                        PVOID pid_base_address = comms.GetImageBase(pid)->ImageBase;
+                        PVOID pid_text_address = NULL;
+                        SIZE_T text_size = 0;
+                        PBYTE text_memory = NULL;
+                        TCHAR exePath[MAX_PATH] = { 0 };
+                        DWORD pathSize = MAX_PATH;
+                        util.GetProcessTextSectionInfo(pid, pid_base_address, &pid_text_address, &text_size, &text_memory);
 
 
-                    if (/*CONDITION*/ TRUE) {
-                        if (!util.TerminateProcessByPID(pid)) {
-                            BOOL result = comms.KillProcess(pid);
-                            if (!result) {
-                                wprintf(L"Failed to kill process %d. Please investigate this.\n", pid);
+
+                        // Call code for determining the text_memory is malicious
+
+
+
+                        if (/*CONDITION*/ TRUE) {
+                            std::wcout << L"PID " << pid << L" IS DEEMED MALICIOUS! Killing process now!\n";
+                            util.GetProcessExecutablePath(pid, exePath, pathSize);
+                            if (!util.TerminateProcessByPID(pid)) {
+                                //BOOL result = comms.KillProcess(pid);
+                                BOOL result = TRUE;
+                                if (!result) {
+                                    wprintf(L"Failed to kill process %d. Please investigate this.\n", pid);
+                                }
                             }
-                        }
-                        else {
-                            wprintf(L"Successfully termianted process %d!", pid);
+                            else {
+                                wprintf(L"Successfully termianted process %d!\n", pid);
+                            }
+
+                            util.DeleteFileWithFallback(exePath);
                         }
                     }
                 }
             }
+
         }
 
+        return ERROR_SUCCESS;
     }
-
-    return ERROR_SUCCESS;
-}
+};
 
 
 // Main function
@@ -1204,9 +1302,9 @@ INT main(INT argc, LPSTR * argv) {
 
     //printf("%d is the text size\n", edge_text_size);
 
+    PowerExpOrchestrator orch;
 
-
-   return systemtest();
+   return orch.systemtest();
 }
 
 
