@@ -1210,7 +1210,7 @@ public:
             //if (monitor.isConsistentlyHighUsage()) {
             results = comms.GetProcesses();
             if (!results || sizeof(comms.ProcessList) == 0) {
-                printf("Issue getting processes associated to the system. Therefore exiting.");
+                wprintf(L"Issue getting processes associated to the system. Therefore exiting.");
                 return ERROR_ACCESS_DENIED;
             }
 

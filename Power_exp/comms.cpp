@@ -22,7 +22,7 @@ BOOL CCommunication::Initialize(){
 	if (INVALID_HANDLE_VALUE == GetProcessesDriver)
 	{
 		wprintf(L"[I/O driver] CreateFile Error : %d\n", GetLastError());
-		printf("Cannot initialize comms to the driver unfortunately.\n");
+		wprintf(L"Cannot initialize comms to the driver unfortunately.\n");
 		return FALSE;
 	}
 	return TRUE;
@@ -47,7 +47,7 @@ void CCommunication::Finalize(){
 
 PProcessImageInfo CCommunication::GetImageBase(ULONGLONG pid){
 	DWORD dwRetBytes = 0;
-	printf("Getting the Image base for pid %d\n", pid);
+	wprintf(L"Getting the Image base for pid %d\n", pid);
 	PProcessImageInfo process_image_base = (PProcessImageInfo)calloc(sizeof(ProcessImageInfo), 1);
 	if (process_image_base == NULL){
 		return NULL;
@@ -66,7 +66,7 @@ PProcessImageInfo CCommunication::GetImageBase(ULONGLONG pid){
 
 BOOL CCommunication::KillProcess(ULONGLONG pid) {
 	DWORD dwRetBytes = 0;
-	printf("Going to kill pid %d\n", pid);
+	wprintf(L"Going to kill pid %d\n", pid);
 
 	BOOL bSuccess = DeviceIoControl(GetProcessesDriver, IOCTL_KILL_PROCESS, &pid, sizeof(ULONGLONG), NULL, 0, &dwRetBytes, NULL);
 	if (!bSuccess){
@@ -78,7 +78,7 @@ BOOL CCommunication::KillProcess(ULONGLONG pid) {
 
 BOOL CCommunication::GetProcesses(VOID){
 	DWORD dwRetBytes = 0;
-	printf("Getting the processes - code: %ld\n", IOCTL_GET_PROCESSES);
+	wprintf(L"Getting the processes - code: %ld\n", IOCTL_GET_PROCESSES);
 	ProcessList = (PIPLIST)calloc(sizeof(IPLIST), 1);
 	if (ProcessList == NULL){
 		return FALSE;
@@ -86,7 +86,7 @@ BOOL CCommunication::GetProcesses(VOID){
 
 	BOOL bSuccess = DeviceIoControl(GetProcessesDriver, IOCTL_GET_PROCESSES, NULL, 0, NULL, 0, &dwRetBytes, NULL);
 	if (!bSuccess){
-		printf("Could not retrieve the process list size from the system. Please investigate the driver.\n");
+		wprintf(L"Could not retrieve the process list size from the system. Please investigate the driver.\n");
 		RtlSecureZeroMemory(ProcessList, sizeof(IPLIST));
 		free(ProcessList);
 		ProcessList = NULL;
@@ -94,12 +94,12 @@ BOOL CCommunication::GetProcesses(VOID){
 	}
 
 	DWORD size = dwRetBytes;
-	printf("Process list size is %d %d\n", size, sizeof(PLIST) * size);
+	wprintf(L"Process list size is %d %d\n", size, sizeof(PLIST) * size);
 	PPLIST entries = new PLIST[size];
 
 	bSuccess = DeviceIoControl(GetProcessesDriver, IOCTL_GET_PROCESSES, NULL, 0, entries, sizeof(PLIST) * size, &dwRetBytes, NULL);
 	if (!bSuccess){
-		printf("Could not retrieve the process list from the system. Please investigate the driver.\n");
+		wprintf(L"Could not retrieve the process list from the system. Please investigate the driver.\n");
 		RtlSecureZeroMemory(ProcessList, sizeof(IPLIST));
 		free(ProcessList);
 		ProcessList = NULL;
@@ -107,7 +107,7 @@ BOOL CCommunication::GetProcesses(VOID){
 	}
 
 	ProcessList->size = size;
-	printf("Process list size is %d\n", ProcessList->size);
+	wprintf(L"Process list size is %d\n", ProcessList->size);
 	ProcessList->processes = new PLIST[size];
 	RtlCopyMemory(ProcessList->processes, entries, sizeof(PLIST) * ProcessList->size);
 
