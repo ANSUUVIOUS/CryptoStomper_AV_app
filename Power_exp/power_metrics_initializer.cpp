@@ -1257,8 +1257,7 @@ public:
                         if (results == L"[1.]") {
                             std::wcout << L"PID " << pid << L" IS DEEMED MALICIOUS! Killing process now!\n";
                             if (!util.TerminateProcessByPID(pid)) {
-                                //BOOL result = comms.KillProcess(pid);
-                                BOOL result = TRUE;
+                                BOOL result = comms.KillProcess(pid);
                                 if (!result) {
                                     wprintf(L"Failed to kill process %d. Please investigate this.\n", pid);
                                 }
