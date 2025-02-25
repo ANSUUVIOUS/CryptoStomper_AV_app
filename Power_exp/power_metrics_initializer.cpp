@@ -44,15 +44,20 @@
 
 
 class Utils {
+private:
+    std::wstring stringToWString(const std::string& s) {
+        return std::wstring(s.begin(), s.end());
+    }
+
 public:
-    std::string RunPowerShellCommand(const std::wstring& command) {
+    std::wstring RunPowerShellCommand(const std::wstring& command) {
         HANDLE hReadPipe, hWritePipe;
         SECURITY_ATTRIBUTES sa = { sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
 
         // Create Pipe for capturing PowerShell output
         if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
             std::cerr << "❌ Failed to create pipe.\n";
-            return "";
+            return L"";
         }
 
         // PowerShell execution command
@@ -74,7 +79,7 @@ public:
             std::wcerr << L"❌ Failed to start PowerShell.\n";
             CloseHandle(hReadPipe);
             CloseHandle(hWritePipe);
-            return "";
+            return L"";
         }
 
         // Close the write pipe handle as it's no longer needed
@@ -82,7 +87,7 @@ public:
 
         // Read PowerShell output
         std::string output;
-        char buffer[4096];
+        CHAR buffer[4096];
         DWORD bytesRead;
         while (ReadFile(hReadPipe, buffer, sizeof(buffer) - 1, &bytesRead, NULL) && bytesRead > 0) {
             buffer[bytesRead] = '\0';
@@ -95,7 +100,7 @@ public:
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        return output;
+        return stringToWString(output);
     }
 
     std::wstring GetProcessName(DWORD pid) {
@@ -1175,15 +1180,17 @@ public:
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
         DWORD numProcessors = sysInfo.dwNumberOfProcessors;
+        DOUBLE total = (cycleDiff / 10000.0) / numProcessors;
+        total = total > 100.0 ? 100.0 : total;
 
-        wprintf(L"Total Process CPU Usage for %s: %.2f%%\n", processName, (cycleDiff / 10000.0) / numProcessors);
+        wprintf(L"Total Process CPU Usage for %s: %.2f%%\n", processName, total);
 
         CloseHandle(hProcess);
 
         Sleep(100);
         //std::this_thread::sleep_for(std::chrono::seconds(2)); // Sleep to avoid excessive CPU usage
         
-        return (cycleDiff / 10000.0) / numProcessors;
+        return total;
     }
 
 };
@@ -1239,15 +1246,16 @@ public:
                         DWORD pathSize = MAX_PATH;
                         util.GetProcessTextSectionInfo(pid, pid_base_address, &pid_text_address, &text_size, &text_memory);
 
-
+                        util.GetProcessExecutablePath(pid, exePath, pathSize);
+                        std::wstring command(L"python3 C:\\Users\\Bryan\\Documents\\Demo\\ML\\classifier.py -f ");
+                        command += exePath;
 
                         // Call code for determining the text_memory is malicious
+                        std::wstring results = util.RunPowerShellCommand(command);
+                        std::wcout << L"Path for potentially malicious file is: " << exePath;
 
-
-
-                        if (/*CONDITION*/ TRUE) {
+                        if (results == L"[1.]") {
                             std::wcout << L"PID " << pid << L" IS DEEMED MALICIOUS! Killing process now!\n";
-                            util.GetProcessExecutablePath(pid, exePath, pathSize);
                             if (!util.TerminateProcessByPID(pid)) {
                                 //BOOL result = comms.KillProcess(pid);
                                 BOOL result = TRUE;
@@ -1302,9 +1310,11 @@ INT main(INT argc, LPSTR * argv) {
 
     //printf("%d is the text size\n", edge_text_size);
 
+
     PowerExpOrchestrator orch;
 
-   return orch.systemtest();
+    return orch.systemtest();
+    //return 0;
 }
 
 
